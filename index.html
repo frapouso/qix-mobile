@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>QIX Mobile</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; }
+  html,body { height:100%; background:#000; overflow:hidden; font-family:monospace; color:#0ff; touch-action:none; }
+  #game { display:block; width:100vw; height:100vh; }
+  #ui { position:fixed; inset:auto 0 0 0; display:flex; justify-content:space-between; align-items:flex-end; padding:10px; gap:10px; }
+  .pad { display:grid; grid-template-columns:repeat(3,52px); grid-template-rows:repeat(3,52px); gap:4px; }
+  button { background:#001a1a; border:2px solid #0ff; color:#0ff; font:bold 18px monospace; border-radius:8px; }
+  button:active { background:#0ff; color:#000; }
+  .blank { visibility:hidden; }
+  #actions { display:flex; flex-direction:column; gap:8px; }
+  #actions button { width:92px; height:52px; font-size:14px; }
+  #hud { position:fixed; top:6px; left:8px; right:8px; display:flex; justify-content:space-between; font-size:13px; text-shadow:0 0 6px #0ff; }
+  #overlay { position:fixed; inset:0; display:flex; flex-direction:column; justify-content:center; align-items:center; background:rgba(0,0,0,.82); text-align:center; padding:24px; }
+  #overlay h1 { color:#0ff; font-size:28px; margin-bottom:12px; }
+  #overlay p { color:#9ff; font-size:14px; line-height:1.5; max-width:340px; }
+  #overlay button { margin-top:18px; padding:12px 22px; font-size:16px; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="hud">
+  <span id="score">0</span>
+  <span id="area">0%</span>
+  <span id="lives">♥♥♥</span>
+</div>
+
+<div id="ui">
+  <div class="pad">
+    <button class="blank"></button>
+    <button data-dir="up">▲</button>
+    <button class="blank"></button>
+    <button data-dir="left">◀</button>
+    <button class="blank"></button>
+    <button data-dir="right">▶</button>
+    <button class="blank"></button>
+    <button data-dir="down">▼</button>
+    <button class="blank"></button>
+  </div>
+  <div id="actions">
+    <button id="slow">LENTO</button>
+    <button id="fast">RÁPIDO</button>
+  </div>
+</div>
+
+<div id="overlay">
+  <h1>QIX MOBILE</h1>
+  <p>Use o direcional para mover pelas bordas.<br>
+  Segure <b>LENTO</b> ou <b>RÁPIDO</b> para invadir a área e desenhar.<br>
+  Feche o traçado numa borda para conquistar a região sem o Qix.<br><br>
+  Conquiste <b>75%</b> para avançar. Não pare desenhando: o fusível queima a linha!</p>
+  <button id="start">JOGAR</button>
+</div>
+
+<script>
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const COLS = 26, ROWS = 36;
+let cell = 10, ox = 0, oy = 0;
+
+let claimed, trail, trailSet, player, qixes, sparx, fuse;
+let drawing = null, dir = null, lives = 3, score = 0, level = 1;
+let running = false, lastMove = 0, idleTime = 0, fuseTimer = 0, fuseIndex = 0;
+let last = 0;
+
+const idx = (x,y) => y * COLS + x;
+const inside = (x,y) => x >= 0 && y >= 0 && x < COLS && y < ROWS;
+const isClaimed = (x,y) => claimed[idx(x,y)] === 1;
+
+function resize() {
+  const w = innerWidth, h = innerHeight - 130;
+  cell = Math.floor(Math.min(w / COLS, h / ROWS));
+  cv.width = w * devicePixelRatio;
+  cv.height = h * devicePixelRatio;
+  cv.style.height = h + 'px';
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+  ox = Math.floor((w - COLS * cell) / 2);
+  oy = 8;
+}
+
+function resetLevel() {
+  claimed = new Uint8Array(COLS * ROWS);
+  for (let x=0; x<COLS; x++) { claimed[idx(x,0)] = 1; claimed[idx(x,ROWS-1)] = 1; }
+  for (let y=0; y<ROWS; y++) { claimed[idx(0,y)] = 1; claimed[idx(COLS-1,y)] = 1; }
+  trail = []; trailSet = new Set();
+  player = { x: Math.floor(COLS/2), y: ROWS-1 };
+  drawing = null; dir = null; fuseIndex = 0; idleTime = 0; fuseTimer = 0;
+  spawnQixes();
+  spawnSparx();
+}
+
+function spawnQixes() {
+  qixes = [];
+  const n = level >= 3 ? 2 : 1;
+  for (let i=0; i<n; i++) {
+    const pts = [];
+    for (let j=0; j<7; j++) {
+      pts.push({
+        x: 3 + Math.random() * (COLS-6),
+        y: 3 + Math.random() * (ROWS-6),
+        vx: (Math.random()-.5) * .09 * (1 + level*.08),
+        vy: (Math.random()-.5) * .09 * (1 + level*.08)
+      });
+    }
+    qixes.push(pts);
+  }
+}
+
+function perimeter() {
+  const p = [];
+  for (let x=0; x<COLS; x++) p.push([x,0]);
+  for (let y=1; y<ROWS; y++) p.push([COLS-1,y]);
+  for (let x=COLS-2; x>=0; x--) p.push([x,ROWS-1]);
+  for (let y=ROWS-2; y>=1; y--) p.push([0,y]);
+  return p;
+}
+
+function spawnSparx() {
+  const p = perimeter();
+  const start = Math.floor(p.length * .5);
+  sparx = [
+    { path:p, i:start, d:1, speed:.055 + level*.008 },
+    { path:p, i:(start + Math.floor(p.length/2)) % p.length, d:-1, speed:.055 + level*.008 }
+  ];
+}
+
+function startGame() {
+  lives = 3; score = 0; level = 1;
+  resetLevel();
+  running = true;
+  document.getElementById('overlay').style.display = 'none';
+  last = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function die() {
+  lives--;
+  trail = []; trailSet.clear(); drawing = null; dir = null; fuseIndex = 0; idleTime = 0;
+  player = { x: Math.floor(COLS/2), y: ROWS-1 };
+  if (lives <= 0) {
+    running = false;
+    document.getElementById('overlay').style.display = 'flex';
+    document.querySelector('#overlay h1').textContent = 'GAME OVER';
+    document.querySelector('#overlay p').innerHTML = `Pontuação: <b>${score}</b><br>Toque em JOGAR para reiniciar.`;
+    document.getElementById('start').textContent = 'JOGAR';
+  }
+}
+
+function closeArea() {
+  const total = (COLS-2) * (ROWS-2);
+  const reach = new Uint8Array(COLS * ROWS);
+  const stack = [];
+
+  for (const q of qixes) {
+    const sx = Math.max(0, Math.min(COLS-1, Math.floor(q[0].x)));
+    const sy = Math.max(0, Math.min(ROWS-1, Math.floor(q[0].y)));
+    if (!isClaimed(sx,sy) && !reach[idx(sx,sy)]) {
+      reach[idx(sx,sy)] = 1; stack.push([sx,sy]);
+    }
+  }
+
+  while (stack.length) {
+    const [x,y] = stack.pop();
+    for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx=x+dx, ny=y+dy;
+      if (!inside(nx,ny) || isClaimed(nx,ny) || reach[idx(nx,ny)]) continue;
+      reach[idx(nx,ny)] = 1; stack.push([nx,ny]);
+    }
+  }
+
+  let gained = 0, slowOnly = drawing === 'slow';
+  for (let y=1; y<ROWS-1; y++) {
+    for (let x=1; x<COLS-1; x++) {
+      const i = idx(x,y);
+      if (!isClaimed(x,y) && !reach[i]) {
+        claimed[i] = 1; gained++;
+      }
+    }
+  }
+
+  for (const t of trail) if (!isClaimed(t.x,t.y)) claimed[idx(t.x,t.y)] = 1;
+
+  const mult = slowOnly ? 2 : 1;
+  score += gained * 10 * mult;
+  trail = []; trailSet.clear(); drawing = null; fuseIndex = 0; idleTime = 0;
+
+  let owned = 0;
+  for (let y=1; y<ROWS-1; y++) for (let x=1; x<COLS-1; x++) if (isClaimed(x,y)) owned++;
+  const pct = owned / total;
+
+  if (pct >= .75) {
+    score += Math.max(0, Math.round((pct - .75) * 100)) * 1000;
+    level++;
+    resetLevel();
+  }
+}
+
+function tryMove(nx, ny) {
+  if (!inside(nx,ny)) return;
+  const isTrail = trailSet.has(idx(nx,ny));
+  const isClaim = isClaimed(nx,ny);
+
+  if (drawing) {
+    if (isClaim) { player.x=nx; player.y=ny; closeArea(); return; }
+    if (isTrail) return;
+    if (isClaimed(nx,ny)) return;
+    trail.push({x:nx,y:ny}); trailSet.add(idx(nx,ny));
+    player.x=nx; player.y=ny;
+    idleTime = 0; fuseTimer = 0; fuseIndex = 0;
+    return;
+  }
+
+  if (!isClaim) return;
+  player.x=nx; player.y=ny;
+}
+
+function update(dt) {
+  const speed = drawing === 'slow' ? 90 : drawing === 'fast' ? 170 : 150;
+  if (dir && performance.now() - lastMove >= speed) {
+    lastMove = performance.now();
+    const d = {up:[0,-1],down:[0,1],left:[-1,0],right:[1,0]}[dir];
+    tryMove(player.x+d[0], player.y+d[1]);
+  }
+
+  if (drawing) {
+    idleTime += dt;
+    if (idleTime > 1200) {
+      fuseTimer += dt;
+      if (fuseTimer > 130) {
+        fuseTimer = 0;
+        fuseIndex++;
+        if (fuseIndex >= trail.length) { die(); return; }
+      }
+    }
+  }
+
+  for (const q of qixes) {
+    let minX=1, maxX=COLS-2, minY=1, maxY=ROWS-2;
+    let found = false;
+    for (let y=1; y<ROWS-1; y++) for (let x=1; x<COLS-1; x++) {
+      if (!isClaimed(x,y)) {
+        minX=Math.min(minX,x); maxX=Math.max(maxX,x);
+        minY=Math.min(minY,y); maxY=Math.max(maxY,y); found=true;
+      }
+    }
+    if (!found) continue;
+
+    for (const p of q) {
+      p.x += p.vx * dt * .06;
+      p.y += p.vy * dt * .06;
+      if (p.x < minX) { p.x = minX; p.vx *= -1; }
+      if (p.x > maxX) { p.x = maxX; p.vx *= -1; }
+      if (p.y < minY) { p.y = minY; p.vy *= -1; }
+      if (p.y > maxY) { p.y = maxY; p.vy *= -1; }
+    }
+
+    if (drawing) {
+      for (let i=0; i<q.length-1; i++) {
+        const a=q[i], b=q[i+1];
+        const steps = Math.ceil(Math.hypot(b.x-a.x,b.y-a.y)*2);
+        for (let s=0; s<=steps; s++) {
+          const x = Math.floor(a.x + (b.x-a.x)*s/steps);
+          const y = Math.floor(a.y + (b.y-a.y)*s/steps);
+          if (trailSet.has(idx(x,y))) { die(); return; }
+        }
+      }
+    }
+  }
+
+  for (const s of sparx) {
+    s.i = (s.i + s.d * s.speed * dt * .06 + s.path.length) % s.path.length;
+    const [x,y] = s.path[Math.floor(s.i)];
+    if (x === player.x && y === player.y) { die(); return; }
+  }
+}
+
+function draw() {
+  const w = cv.width / devicePixelRatio, h = cv.height / devicePixelRatio;
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,w,h);
+
+  for (let y=0; y<ROWS; y++) {
+    for (let x=0; x<COLS; x++) {
+      if (isClaimed(x,y)) {
+        ctx.fillStyle = (x===0||y===0||x===COLS-1||y===ROWS-1) ? '#004455' : '#003b66';
+        ctx.fillRect(ox+x*cell, oy+y*cell, cell, cell);
+      }
+    }
+  }
+
+  ctx.lineWidth = Math.max(2, cell*.28);
+  ctx.lineCap = 'round';
+
+  if (trail.length) {
+    ctx.strokeStyle = drawing === 'slow' ? '#ff4444' : '#00ffff';
+    ctx.beginPath();
+    ctx.moveTo(ox+(trail[0].x+.5)*cell, oy+(trail[0].y+.5)*cell);
+    for (const t of trail) ctx.lineTo(ox+(t.x+.5)*cell, oy+(t.y+.5)*cell);
+    ctx.stroke();
+
+    if (fuseIndex > 0) {
+      ctx.strokeStyle = '#ffaa00'; ctx.lineWidth = Math.max(3, cell*.4);
+      ctx.beginPath();
+      ctx.moveTo(ox+(trail[0].x+.5)*cell, oy+(trail[0].y+.5)*cell);
+      for (let i=1; i<=Math.min(fuseIndex, trail.length-1); i++)
+        ctx.lineTo(ox+(trail[i].x+.5)*cell, oy+(trail[i].y+.5)*cell);
+      ctx.stroke();
+    }
+  }
+
+  const colors = ['#ff00ff','#00ff88','#ffcc00','#ff5555'];
+  qixes.forEach((q,i) => {
+    ctx.strokeStyle = colors[i % colors.length];
+    ctx.lineWidth = Math.max(3, cell*.35);
+    ctx.beginPath();
+    ctx.moveTo(ox+q[0].x*cell, oy+q[0].y*cell);
+    for (const p of q) ctx.lineTo(ox+p.x*cell, oy+p.y*cell);
+    ctx.stroke();
+  });
+
+  ctx.fillStyle = '#ff2222';
+  for (const s of sparx) {
+    const [x,y] = s.path[Math.floor(s.i)];
+    ctx.beginPath();
+    ctx.arc(ox+(x+.5)*cell, oy+(y+.5)*cell, cell*.42, 0, 7);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = '#ffffff';
+  ctx.save();
+  ctx.translate(ox+(player.x+.5)*cell, oy+(player.y+.5)*cell);
+  ctx.rotate(Math.PI/4);
+  ctx.fillRect(-cell*.35,-cell*.35,cell*.7,cell*.7);
+  ctx.restore();
+
+  let owned = 0;
+  for (let y=1; y<ROWS-1; y++) for (let x=1; x<COLS-1; x++) if (isClaimed(x,y)) owned++;
+  const pct = Math.floor(owned / ((COLS-2)*(ROWS-2)) * 100);
+
+  document.getElementById('score').textContent = score;
+  document.getElementById('area').textContent = pct + '% / 75%';
+  document.getElementById('lives').textContent = '♥'.repeat(Math.max(0,lives));
+}
+
+function loop(t) {
+  if (!running) return;
+  const dt = Math.min(50, t - last); last = t;
+  update(dt); draw();
+  requestAnimationFrame(loop);
+}
+
+document.querySelectorAll('[data-dir]').forEach(b => {
+  const set = e => { e.preventDefault(); dir = b.dataset.dir; };
+  const clear = e => { e.preventDefault(); dir = null; };
+  b.addEventListener('touchstart', set, {passive:false});
+  b.addEventListener('mousedown', set);
+  b.addEventListener('touchend', clear);
+  b.addEventListener('touchcancel', clear);
+  b.addEventListener('mouseup', clear);
+  b.addEventListener('mouseleave', clear);
+});
+
+document.getElementById('slow').addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (!drawing) { drawing = 'slow'; idleTime = 0; fuseIndex = 0; }
+}, {passive:false});
+
+document.getElementById('fast').addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (!drawing) { drawing = 'fast'; idleTime = 0; fuseIndex = 0; }
+}, {passive:false});
+
+document.getElementById('start').addEventListener('click', startGame);
+addEventListener('resize', resize);
+resize();
+resetLevel();
+draw();
+</script>
+</body>
+</html>
